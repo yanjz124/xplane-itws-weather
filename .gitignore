@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+itws_weather.json
+itws_captures/
