@@ -67,6 +67,7 @@ from XPStandardWidgets import (
 
 from itws_airports import ITWS_AIRPORTS
 import itws_swim
+import itws_ws
 
 
 AWC_ITWS_URL = "https://aviationweather.gov/api/data/itws?id={icao}&format=json"
@@ -83,11 +84,30 @@ DEFAULTS = {
     "swim_base_url": itws_swim.DEFAULT_BASE,
     "swim_enabled": True,
     "awc_enabled": True,
+    "swim_websocket": True,
 }
 
 
 def _log(msg: str) -> None:
     XPLMDebugString(f"[ITWSWeather] {msg}\n")
+
+
+# NWS reflectivity level -> visibility ceiling in meters (rough VFR/IFR mapping).
+# Level 0 = no precip (None: don't constrain); level 6 = extreme.
+_PRECIP_VIS_M = {
+    1: 16093.0,   # 10 SM
+    2: 9656.0,    # 6 SM
+    3: 4828.0,    # 3 SM
+    4: 2414.0,    # 1.5 SM
+    5: 1207.0,    # 0.75 SM
+    6: 402.0,     # 0.25 SM
+}
+
+
+def _precip_visibility_m(level):
+    if level is None or level <= 0:
+        return None
+    return _PRECIP_VIS_M.get(int(level))
 
 
 def _nm_between(lat1, lon1, lat2, lon2):
@@ -213,6 +233,15 @@ def _latest_swim(icao, base_url):
         }
     cf["runway_alerts"] = itws_swim.runway_winds(parsed)
     cf["upper_layers"] = upper
+
+    # Precip near the airport (max NWS level 0..6 in a 5 km box around ARP).
+    alat, alon, _elev = ITWS_AIRPORTS.get(icao, (None, None, None))
+    if alat is not None:
+        grid = itws_swim.best_precip_grid(parsed, alat, alon)
+        if grid is not None:
+            cf["precip_level"] = itws_swim.precip_max_near(grid, alat, alon, radius_m=5000)
+            cf["precip_volume_scan"] = grid.get("volume_scan_num")
+
     _capture_polygon_samples(icao, parsed)
 
     # Useful alert flags (not injected into weather, but logged on transition)
@@ -272,11 +301,17 @@ class _Fetcher(threading.Thread):
         self.cfg = cfg
         self.interval_s = max(15.0, float(cfg["poll_interval_s"]))
         self._stop = threading.Event()
+        self._wake = threading.Event()  # set by WS on invalidation
         self._lock = threading.Lock()
         self._sample = None
 
     def stop(self):
         self._stop.set()
+        self._wake.set()
+
+    def wake(self):
+        """Trigger an immediate refetch instead of waiting for the next tick."""
+        self._wake.set()
 
     def latest(self):
         with self._lock:
@@ -287,10 +322,12 @@ class _Fetcher(threading.Thread):
             sample = self._fetch_chain()
             with self._lock:
                 self._sample = sample
-            for _ in range(int(self.interval_s)):
-                if self._stop.is_set():
-                    return
-                time.sleep(1.0)
+            self._wake.clear()
+            # Wait until either the poll interval elapses, the plugin is
+            # stopping, or a WS invalidation kicks us.
+            self._wake.wait(timeout=self.interval_s)
+            if self._stop.is_set():
+                return
 
     def _fetch_chain(self):
         # 1. SwimReader (richer: per-runway data when available)
@@ -351,6 +388,7 @@ class _SettingsWindow:
         rows = [
             ("enabled", "Enabled (1/0)"),
             ("swim_enabled", "SwimReader source (1/0)"),
+            ("swim_websocket", "SwimReader WebSocket (1/0)"),
             ("awc_enabled", "AWC fallback (1/0)"),
             ("swim_base_url", "SwimReader base URL"),
             ("poll_interval_s", "Poll interval (seconds, >=15)"),
@@ -395,7 +433,7 @@ class _SettingsWindow:
 
     def _apply_from_fields(self):
         cfg = dict(self.plugin.cfg)
-        bool_keys = ("enabled", "swim_enabled", "awc_enabled")
+        bool_keys = ("enabled", "swim_enabled", "awc_enabled", "swim_websocket")
         str_keys = ("swim_base_url",)
         for key, tf in self.fields.items():
             raw = XPGetWidgetDescriptor(tf).strip()
@@ -435,6 +473,7 @@ class _Plugin:
         self._lon_ref = None
         self._fetchers = {}  # icao -> _Fetcher
         self._last_alerts = {}  # icao -> previous alerts dict, for transition logging
+        self._ws = None  # itws_ws.WSClient or None
 
         # Menu
         self._menu_container_idx = None
@@ -459,6 +498,7 @@ class _Plugin:
         XPLMScheduleFlightLoop(self._loop_id, LOOP_INTERVAL_S, 1)
 
         self._build_menu()
+        self._start_websocket()
         _log(f"started; cfg={self.cfg}")
         return self.name, self.sig, self.desc
 
@@ -466,6 +506,7 @@ class _Plugin:
         if self._loop_id is not None:
             XPLMDestroyFlightLoop(self._loop_id)
             self._loop_id = None
+        self._stop_websocket()
         self._stop_all_fetchers()
         self._settings.destroy()
         if self._menu_id is not None:
@@ -511,15 +552,21 @@ class _Plugin:
 
     def update_config(self, cfg):
         old_interval = self.cfg["poll_interval_s"]
+        old_ws = (self.cfg.get("swim_websocket"), self.cfg.get("swim_enabled"),
+                  self.cfg.get("swim_base_url"))
         self.cfg = cfg
         _save_config(cfg)
         self._refresh_menu()
         if old_interval != cfg["poll_interval_s"]:
-            # Restart all active fetchers with the new interval.
             active = list(self._fetchers.keys())
             self._stop_all_fetchers()
             for icao in active:
                 self._start_fetcher(icao)
+        new_ws = (cfg.get("swim_websocket"), cfg.get("swim_enabled"),
+                  cfg.get("swim_base_url"))
+        if old_ws != new_ws:
+            self._stop_websocket()
+            self._start_websocket()
         _log(f"config updated: {cfg}")
 
     # ---- core loop ----
@@ -550,6 +597,55 @@ class _Plugin:
                 self._apply(icao, sample)
                 self._log_alert_transitions(icao, sample.get("alerts") or {})
         return LOOP_INTERVAL_S
+
+    # ---- websocket ----
+    def _start_websocket(self):
+        if self._ws is not None:
+            return
+        if not self.cfg.get("swim_websocket", True):
+            return
+        if not self.cfg.get("swim_enabled", True):
+            return
+        try:
+            self._ws = itws_ws.WSClient(
+                base_url=self.cfg.get("swim_base_url", itws_swim.DEFAULT_BASE),
+                on_event=self._on_ws_event,
+                on_error=lambda e: _log(f"ws error: {e!r}"),
+            )
+            self._ws.start()
+        except Exception as e:  # noqa: BLE001
+            _log(f"ws start failed: {e!r}")
+            self._ws = None
+
+    def _stop_websocket(self):
+        if self._ws is not None:
+            self._ws.stop()
+            self._ws = None
+
+    def _on_ws_event(self, msg):
+        # SwimReader frame: {type: 'snapshot'|'update', data: {...} or [{...}]}
+        # 'data' carries 'site' (3-letter, no K-prefix) and 'productType'.
+        # Snapshots are sent on connect; updates on each new product publish.
+        # 'site' == 'ALL' means the product applies to every airport.
+        sites = set()
+        data = msg.get("data")
+        if isinstance(data, dict):
+            data = [data]
+        for d in (data or []):
+            s = d.get("site") or d.get("airport")
+            if s:
+                sites.add(s)
+        if not sites or "ALL" in sites:
+            for f in self._fetchers.values():
+                f.wake()
+            return
+        for s in sites:
+            # SwimReader sites are 3-letter (PHL); ITWS_AIRPORTS uses ICAO (KPHL).
+            for icao in (f"K{s}", s):
+                f = self._fetchers.get(icao)
+                if f is not None:
+                    f.wake()
+                    break
 
     def _log_alert_transitions(self, icao, alerts):
         prev = self._last_alerts.get(icao, {})
@@ -612,8 +708,15 @@ class _Plugin:
 
         info.wind_layers = layers
 
-        if s.get("visib_sm") is not None:
-            info.visibility = float(s["visib_sm"]) * 1609.34
+        # Visibility: start with METAR value (if any), then clamp downward
+        # if ITWS sees real precip near the field.
+        vis_m = float(s["visib_sm"]) * 1609.34 if s.get("visib_sm") is not None else None
+        precip_vis = _precip_visibility_m(s.get("precip_level"))
+        if precip_vis is not None:
+            vis_m = precip_vis if vis_m is None else min(vis_m, precip_vis)
+        if vis_m is not None:
+            info.visibility = vis_m
+
         if s.get("altim_hpa") is not None:
             info.pressure_sl = float(s["altim_hpa"]) * 100.0
         if s.get("temp") is not None:

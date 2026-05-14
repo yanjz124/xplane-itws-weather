@@ -24,8 +24,19 @@ MICROBURST_ATIS = "Microburst ATIS Product"
 GUST_FRONT_ETI = "Gust Front ETI Product"
 WIND_PROFILE = "Wind Profile Product"
 TORNADO_ALERT = "Tornado Alert Product"
+PRECIP_TRACON = "Precipitation TRACON Product"
+PRECIP_5NM = "Precipitation 5nm Product"
+PRECIP_LONG = "Precipitation Long Range Product"
+SM_SEP_TRACON = "SM SEP TRACON Product"
+SM_SEP_5NM = "SM SEP 5nm Product"
+SM_SEP_LONG = "SM SEP Long Range Product"
 
 WIND_QUALITY_OK = ("VALID", "GOOD")
+
+# Precipitation grid sentinel cells (per FAA spec):
+#   level 0..6 = NWS reflectivity classification
+#   7 = attenuated, 8 = AP-detected, 9 = bad, 15 = no coverage
+PRECIP_SENTINEL_LEVELS = {7, 8, 9, 15}
 
 LLWAS_NO_DATA = 999  # sentinel for both wind_dir and wind_speed in ca_ra_*
 
@@ -182,6 +193,159 @@ def parse_tornado_alert(xml_str):
     }
 
 
+def _decode_precip_rle(s):
+    """Simple RLE: 'level,count level,count ...' -> flat list of int levels."""
+    out = []
+    if not s:
+        return out
+    for tok in s.split():
+        try:
+            level_s, count_s = tok.split(",", 1)
+            level = int(level_s)
+            count = int(count_s)
+        except ValueError:
+            continue
+        if count > 0:
+            out.extend([level] * count)
+    return out
+
+
+def parse_precip(xml_str):
+    """Decode a Precipitation Product into metadata + flat row-major level grid.
+
+    Grid cells: 0..6 = NWS reflectivity level (0=no precip), 7/8/9/15 sentinels.
+    """
+    try:
+        root = ET.fromstring(xml_str)
+    except ET.ParseError:
+        return None
+    p = root.find("precip")
+    if p is None:
+        return None
+    nws = p.find("prcp_nws_levels")
+    grid_str = _text(nws, "prcp_grid_compressed") if nws is not None else None
+    nrows = _int(p, "prcp_nrows")
+    ncols = _int(p, "prcp_ncols")
+    if not grid_str or not nrows or not ncols:
+        return None
+    cells = _decode_precip_rle(grid_str)
+    if len(cells) != nrows * ncols:
+        # Don't trust a partially decoded grid.
+        return None
+
+    # XML stores lat/lon as integer degrees * 1e6.
+    trp_lat = (_int(p, "prcp_TRP_latitude") or 0) / 1_000_000.0
+    trp_lon = (_int(p, "prcp_TRP_longitude") or 0) / 1_000_000.0
+    rotation_milli = _int(p, "prcp_rotation") or 0  # degrees * 1000
+    return {
+        "trp_lat": trp_lat,
+        "trp_lon": trp_lon,
+        "rotation_deg": rotation_milli / 1000.0,
+        "x_offset_m": _int(p, "prcp_xoffset") or 0,
+        "y_offset_m": _int(p, "prcp_yoffset") or 0,
+        "dx_m": _int(p, "prcp_dx") or 1000,
+        "dy_m": _int(p, "prcp_dy") or 1000,
+        "nrows": nrows,
+        "ncols": ncols,
+        "max_level": _int(nws, "prcp_grid_max_precip_level") if nws is not None else None,
+        "volume_scan_num": _int(p, "prcp_volume_scan_num"),
+        "cells": cells,  # row-major: cells[r * ncols + c]
+    }
+
+
+def precip_cell_at(grid, lat, lon):
+    """Return the NWS level under (lat, lon), or None if outside the grid.
+
+    Equirectangular projection at the TRP latitude, then -rotation, then
+    offset/dx grid index lookup. Good enough at airport scale.
+    """
+    import math
+    if grid is None:
+        return None
+    dlat = lat - grid["trp_lat"]
+    dlon = lon - grid["trp_lon"]
+    # meters east / north relative to TRP
+    y_m = dlat * 111_320.0
+    x_m = dlon * 111_320.0 * math.cos(math.radians(grid["trp_lat"]))
+    # Apply -rotation to align with grid axes.
+    rot = math.radians(-grid["rotation_deg"])
+    cs, sn = math.cos(rot), math.sin(rot)
+    xg = x_m * cs - y_m * sn
+    yg = x_m * sn + y_m * cs
+    col = int(round((xg - grid["x_offset_m"]) / grid["dx_m"]))
+    row = int(round((yg - grid["y_offset_m"]) / grid["dy_m"]))
+    if not (0 <= col < grid["ncols"] and 0 <= row < grid["nrows"]):
+        return None
+    return grid["cells"][row * grid["ncols"] + col]
+
+
+def precip_max_near(grid, lat, lon, radius_m=5000):
+    """Max real precip level (0..6) within a square of radius_m around (lat,lon).
+
+    Sentinel cells (7/8/9/15) are skipped. Returns 0 if no precip in the box,
+    or None if the airport is outside the grid entirely.
+    """
+    if grid is None:
+        return None
+    # Use a square around the airport pixel — cheap and close enough at this scale.
+    center_level = precip_cell_at(grid, lat, lon)
+    if center_level is None:
+        return None
+    half_x = max(1, radius_m // grid["dx_m"])
+    half_y = max(1, radius_m // grid["dy_m"])
+
+    # Get the airport's pixel coordinate the same way.
+    import math
+    dlat = lat - grid["trp_lat"]
+    dlon = lon - grid["trp_lon"]
+    y_m = dlat * 111_320.0
+    x_m = dlon * 111_320.0 * math.cos(math.radians(grid["trp_lat"]))
+    rot = math.radians(-grid["rotation_deg"])
+    xg = x_m * math.cos(rot) - y_m * math.sin(rot)
+    yg = x_m * math.sin(rot) + y_m * math.cos(rot)
+    cc = int(round((xg - grid["x_offset_m"]) / grid["dx_m"]))
+    rc = int(round((yg - grid["y_offset_m"]) / grid["dy_m"]))
+
+    best = 0
+    ncols = grid["ncols"]
+    cells = grid["cells"]
+    r0 = max(0, rc - half_y)
+    r1 = min(grid["nrows"], rc + half_y + 1)
+    c0 = max(0, cc - half_x)
+    c1 = min(ncols, cc + half_x + 1)
+    for r in range(r0, r1):
+        base = r * ncols
+        for c in range(c0, c1):
+            lvl = cells[base + c]
+            if lvl in PRECIP_SENTINEL_LEVELS:
+                continue
+            if lvl > best:
+                best = lvl
+    return best
+
+
+def parse_sm_sep(xml_str):
+    """Storm Motion / Storm cell Extrapolated Position.
+
+    Currently parses the header (count + TRP) only; the per-storm child
+    schema hasn't been seen with real data yet (num_storms always 0 so far).
+    The plugin captures the raw XML when num_storms>0 so we can extend later.
+    """
+    try:
+        root = ET.fromstring(xml_str)
+    except ET.ParseError:
+        return None
+    sm = root.find("sm_sep")
+    if sm is None:
+        return None
+    return {
+        "num_storms": _int(sm, "sm_num_storms") or 0,
+        "trp_lat": float(_text(sm, "sm_latitude") or 0),
+        "trp_lon": float(_text(sm, "sm_longitude") or 0),
+        "rotation_deg": float(_text(sm, "sm_rotation") or 0),
+    }
+
+
 def _has_active_shapes(xml_str):
     """Quick heuristic: any *_num_detections/predictions/cells > 0 ?
 
@@ -194,7 +358,8 @@ def _has_active_shapes(xml_str):
     except ET.ParseError:
         return False
     for tag in ("mbt_num_detections", "mbt_num_predictions",
-                "gft_rdr_num_detections", "ht_num_cells"):
+                "gft_rdr_num_detections", "ht_num_cells",
+                "sm_num_storms"):
         for elem in root.iter(tag):
             try:
                 if int((elem.text or "0").strip()) > 0:
@@ -213,6 +378,9 @@ def find_active_polygon_samples(parsed):
         "Gust Front TRACON Map Product",
         "Hazard Text TRACON Product",
         "Hazard Text 5nm Product",
+        SM_SEP_TRACON,
+        SM_SEP_5NM,
+        SM_SEP_LONG,
     )
     for pt in polygon_types:
         for raw in (parsed.get(pt, {}).get("raw") or []):
@@ -228,6 +396,12 @@ PARSERS = {
     GUST_FRONT_ETI: parse_gust_front_eti,
     WIND_PROFILE: parse_wind_profile,
     TORNADO_ALERT: parse_tornado_alert,
+    PRECIP_TRACON: parse_precip,
+    PRECIP_5NM: parse_precip,
+    PRECIP_LONG: parse_precip,
+    SM_SEP_TRACON: parse_sm_sep,
+    SM_SEP_5NM: parse_sm_sep,
+    SM_SEP_LONG: parse_sm_sep,
 }
 
 
@@ -317,6 +491,19 @@ def upper_wind_layers(parsed):
             "qualities": sorted({q for _, _, q in samples}),
         })
     return layers
+
+
+def best_precip_grid(parsed, lat, lon):
+    """Pick the most useful precip grid covering (lat, lon).
+
+    Prefers higher-resolution products. Returns the parsed grid dict (with
+    cells), or None if no product covers the airport.
+    """
+    for pt in (PRECIP_5NM, PRECIP_TRACON, PRECIP_LONG):
+        for g in (parsed.get(pt, {}).get("parsed") or []):
+            if precip_cell_at(g, lat, lon) is not None:
+                return g
+    return None
 
 
 def runway_winds(parsed):

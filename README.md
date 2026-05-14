@@ -4,12 +4,15 @@ X-Plane 12 plugin (XPPython3) that injects FAA Integrated Terminal Weather Syste
 
 ## Data sources (priority order)
 
-1. **SwimReader** — private FAA SWIM bridge (Solace → REST). Provides:
+1. **SwimReader** — private FAA SWIM bridge (Solace → REST + WebSocket). Provides:
    - Centerfield wind (Configured Alerts Product)
    - Per-runway-end LLWAS wind, when LLWAS is healthy
    - 9 upper-wind layers from 2000–10000 ft AGL (Wind Profile Product), vector-meaned across all TRACON grid stations
    - Wind shear / microburst / gust-front / tornado alert flags (logged on transition)
-   - Auto-captures raw XML for polygon products (microburst alarm box, gust front map, hazard text cells) the first time they carry real shape data, so parsers can be written against real samples
+   - Precipitation Product RLE-decoded into a row-major NWS-level grid; max level in a 5 km box around the airport drives X-Plane visibility
+   - Storm Motion (SM SEP) header parsed; raw XML captured on first non-empty publication for parser development
+   - Auto-captures raw XML for polygon products (microburst alarm box, gust front map, hazard text cells) the first time they carry real shape data
+   - WebSocket invalidation: subscribes to `/itws/ws` and triggers immediate refetch on each `update` event instead of waiting for the next poll tick
 2. **AviationWeather.gov ITWS endpoint** — minute-resolution surface wind for any of the ~45 ITWS-equipped airports
 3. **X-Plane default** — fallthrough when neither source has data
 
@@ -20,6 +23,7 @@ Copy these three files into `<X-Plane>/Resources/plugins/PythonPlugins/`:
 - `PI_ITWSWeather.py`
 - `itws_airports.py`
 - `itws_swim.py`
+- `itws_ws.py`
 
 Requires XPPython3 4.0+ and X-Plane 12.0+ (12.3+ recommended).
 
@@ -31,6 +35,7 @@ Settings are written to `Resources/plugins/PythonPlugins/itws_weather.json` and 
 |---|---|---|
 | `enabled` | `true` | Master on/off (also a toggle in the menu) |
 | `swim_enabled` | `true` | Use SwimReader as primary source |
+| `swim_websocket` | `true` | Use SwimReader WebSocket for sub-minute invalidation (falls back to polling on connect failure) |
 | `awc_enabled` | `true` | Fall back to AviationWeather.gov ITWS |
 | `swim_base_url` | `https://swim.vncrcc.org` | Override to point at a local SWIM bridge |
 | `poll_interval_s` | `60` | Network poll cadence (≥15) |
